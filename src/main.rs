@@ -108,6 +108,8 @@ enum Unit {
     Celsius,
     Percent,
     Rpm,
+    /// Network throughput, stored as bytes per second.
+    Net,
 }
 
 impl Unit {
@@ -116,19 +118,44 @@ impl Unit {
             Unit::Celsius => "Temperature (°C)",
             Unit::Percent => "Usage (%)",
             Unit::Rpm => "Fan (RPM)",
+            Unit::Net => "Network (bytes/s)",
         }
     }
-    fn suffix(self) -> &'static str {
+
+    /// Format a value for the Y-axis tick labels.
+    fn fmt_axis(self, v: f64) -> String {
         match self {
-            Unit::Celsius => "°C",
-            Unit::Percent => "%",
-            Unit::Rpm => "rpm",
+            Unit::Net => fmt_rate(v),
+            _ => format!("{:.0}", v),
+        }
+    }
+
+    /// Format the latest value shown at the right edge of each series.
+    fn fmt_value(self, v: f64) -> String {
+        match self {
+            Unit::Celsius => format!("{:.0}°C", v),
+            Unit::Percent => format!("{:.0}%", v),
+            Unit::Rpm => format!("{:.0}rpm", v),
+            Unit::Net => format!("{}B/s", fmt_rate(v)),
         }
     }
 }
 
+/// Human-readable rate with a decimal (K/M/G) suffix.
+fn fmt_rate(bps: f64) -> String {
+    if bps >= 1e9 {
+        format!("{:.1}G", bps / 1e9)
+    } else if bps >= 1e6 {
+        format!("{:.1}M", bps / 1e6)
+    } else if bps >= 1e3 {
+        format!("{:.0}K", bps / 1e3)
+    } else {
+        format!("{:.0}", bps)
+    }
+}
+
 /// Fixed order in which bands are stacked top to bottom.
-const BAND_ORDER: [Unit; 3] = [Unit::Celsius, Unit::Percent, Unit::Rpm];
+const BAND_ORDER: [Unit; 4] = [Unit::Celsius, Unit::Percent, Unit::Rpm, Unit::Net];
 
 struct Metric {
     unit: Unit,
@@ -142,6 +169,8 @@ struct AppState {
     metrics: BTreeMap<String, Metric>,
     /// Previous /proc/stat counters per CPU line: (idle_all, total).
     prev_cpu: HashMap<String, (u64, u64)>,
+    /// Previous /proc/net/dev totals: (rx_bytes, tx_bytes) across interfaces.
+    prev_net: Option<(u64, u64)>,
     poll_count: u64,
     next_color: usize,
     /// Persisted per-series on/off state (label -> visible), loaded at startup
@@ -179,7 +208,7 @@ fn short_chip(chip: &str) -> &str {
 }
 
 /// Collect one sample of every available metric. Failing sources are skipped silently.
-fn collect(prev_cpu: &mut HashMap<String, (u64, u64)>) -> Vec<(String, Unit, f64)> {
+fn collect(st: &mut AppState) -> Vec<(String, Unit, f64)> {
     let mut out = Vec::new();
 
     // lm-sensors: temperatures (tempN_input) and fans (fanN_input).
@@ -241,7 +270,7 @@ fn collect(prev_cpu: &mut HashMap<String, (u64, u64)>) -> Vec<(String, Unit, f64
             } else {
                 format!("CPU core {}", &name[3..])
             };
-            let pct = match prev_cpu.get(name) {
+            let pct = match st.prev_cpu.get(name) {
                 Some(&(prev_idle, prev_total)) if total > prev_total => {
                     let d_total = (total - prev_total) as f64;
                     let d_idle = (idle_all.saturating_sub(prev_idle)) as f64;
@@ -249,7 +278,7 @@ fn collect(prev_cpu: &mut HashMap<String, (u64, u64)>) -> Vec<(String, Unit, f64
                 }
                 _ => 0.0,
             };
-            prev_cpu.insert(name.to_string(), (idle_all, total));
+            st.prev_cpu.insert(name.to_string(), (idle_all, total));
             out.push((label, Unit::Percent, pct.clamp(0.0, 100.0)));
         }
     }
@@ -268,6 +297,33 @@ fn collect(prev_cpu: &mut HashMap<String, (u64, u64)>) -> Vec<(String, Unit, f64
         if total > 0.0 {
             out.push(("Memory".to_string(), Unit::Percent, (total - avail) / total * 100.0));
         }
+    }
+
+    // Network throughput from /proc/net/dev: sum rx/tx bytes over all
+    // interfaces except loopback, then report the per-second delta.
+    if let Ok(net) = fs::read_to_string("/proc/net/dev") {
+        let mut rx_total: u64 = 0;
+        let mut tx_total: u64 = 0;
+        for line in net.lines() {
+            let Some((iface, rest)) = line.split_once(':') else { continue };
+            if iface.trim() == "lo" {
+                continue;
+            }
+            let nums: Vec<u64> = rest.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            // Receive bytes = column 0, transmit bytes = column 8.
+            if nums.len() >= 9 {
+                rx_total += nums[0];
+                tx_total += nums[8];
+            }
+        }
+        if let Some((prev_rx, prev_tx)) = st.prev_net {
+            let dt = POLL_INTERVAL_SECS as f64;
+            let rx_rate = rx_total.saturating_sub(prev_rx) as f64 / dt;
+            let tx_rate = tx_total.saturating_sub(prev_tx) as f64 / dt;
+            out.push(("Network RX (down)".to_string(), Unit::Net, rx_rate));
+            out.push(("Network TX (up)".to_string(), Unit::Net, tx_rate));
+        }
+        st.prev_net = Some((rx_total, tx_total));
     }
 
     out
@@ -337,6 +393,7 @@ fn build_ui(app: &Application) {
     let state = Rc::new(RefCell::new(AppState {
         metrics: BTreeMap::new(),
         prev_cpu: HashMap::new(),
+        prev_net: None,
         poll_count: 0,
         next_color: 0,
         visibility: load_visibility(),
@@ -369,7 +426,7 @@ fn build_ui(app: &Application) {
 
     // Prime once so the graph has data immediately, and seed prev_cpu.
     {
-        let samples = collect(&mut state.borrow_mut().prev_cpu);
+        let samples = collect(&mut state.borrow_mut());
         for (label, unit, value) in samples {
             ensure_metric(&state, &list, &label, unit);
             if let Some(m) = state.borrow_mut().metrics.get_mut(&label) {
@@ -395,7 +452,7 @@ fn build_ui(app: &Application) {
         let list = list.clone();
         let area = area.clone();
         glib::timeout_add_seconds_local(POLL_INTERVAL_SECS, move || {
-            let samples = collect(&mut state.borrow_mut().prev_cpu);
+            let samples = collect(&mut state.borrow_mut());
             for (label, unit, value) in samples {
                 ensure_metric(&state, &list, &label, unit);
                 let mut st = state.borrow_mut();
@@ -410,11 +467,15 @@ fn build_ui(app: &Application) {
             st.poll_count += 1;
             if debug_enabled() {
                 let visible = st.metrics.values().filter(|m| m.visible).count();
+                let rx = st.metrics.get("Network RX (down)").and_then(|m| m.history.back()).copied().unwrap_or(0.0);
+                let tx = st.metrics.get("Network TX (up)").and_then(|m| m.history.back()).copied().unwrap_or(0.0);
                 eprintln!(
-                    "[poll #{}] metrics={} visible={}",
+                    "[poll #{}] metrics={} visible={} net_rx={:.0}B/s net_tx={:.0}B/s",
                     st.poll_count,
                     st.metrics.len(),
-                    visible
+                    visible,
+                    rx,
+                    tx
                 );
             }
             drop(st);
@@ -504,7 +565,8 @@ fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, st: &AppState) {
             }
             if !lo.is_finite() || !hi.is_finite() {
                 (0.0, 1.0)
-            } else if *unit == Unit::Rpm {
+            } else if *unit == Unit::Rpm || *unit == Unit::Net {
+                // Rate/RPM bands are anchored at zero.
                 (0.0, hi.max(1.0))
             } else {
                 (lo, hi)
@@ -540,7 +602,7 @@ fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, st: &AppState) {
             let _ = cr.stroke();
             cr.set_source_rgb(0.4, 0.4, 0.4);
             cr.move_to(MARGIN, y + 3.5);
-            let _ = cr.show_text(&format!("{:.0}", v));
+            let _ = cr.show_text(&unit.fmt_axis(v));
         }
 
         // Frame.
@@ -572,7 +634,7 @@ fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, st: &AppState) {
                 cr.set_source_rgb(r, g, b);
                 cr.set_font_size(10.0);
                 cr.move_to(plot_right + 3.0, y_of(latest.clamp(ymin, ymax)) + 3.0);
-                let _ = cr.show_text(&format!("{:.0}{}", latest, unit.suffix()));
+                let _ = cr.show_text(&unit.fmt_value(latest));
             }
         }
     }
