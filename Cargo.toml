@@ -1,6 +1,6 @@
 [package]
 name = "kagari"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Wayland-native live system metrics graph (psensor replacement)"
 authors = ["Tesh Nakamura <tesh@teshnakamura.com>"]

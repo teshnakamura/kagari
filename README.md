@@ -64,7 +64,7 @@ sudo apt install libgtk-4-dev lm-sensors
 Download (or build) the `.deb` and install it:
 
 ```sh
-sudo apt install ./kagari_0.1.7_amd64.deb
+sudo apt install ./kagari_0.1.8_amd64.deb
 ```
 
 `apt` resolves the runtime dependencies (`libgtk-4-1`, `lm-sensors`). After
@@ -103,12 +103,10 @@ Tunables are constants at the top of `src/main.rs`:
 | `WINDOW_W` / `WINDOW_H` | Initial window size           | `1100` x `620`   |
 | `SIDE_PANEL_W`       | Toggle panel width               | `200`            |
 
-State remembered across runs (under `$XDG_CONFIG_HOME/kagari/`, default
-`~/.config/kagari/`):
-
-- `visibility.json` — the per-series on/off state from the side panel.
-- `colors.json` — per-series custom colors.
-- `window.json` — the last window size.
+State is remembered across runs in a single `config.json` under
+`$XDG_CONFIG_HOME/kagari/` (default `~/.config/kagari/config.json`):
+per-series on/off state, custom colors, the accordion expanded/collapsed state,
+and the window size. (Older split files are migrated automatically.)
 
 ## License
 

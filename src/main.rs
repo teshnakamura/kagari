@@ -73,29 +73,82 @@ fn write_config(name: &str, contents: &str) {
     }
 }
 
-fn load_visibility() -> BTreeMap<String, bool> {
-    config_file("visibility.json")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// All persisted UI state, stored together in a single config.json.
+#[derive(Default)]
+struct LoadedConfig {
+    window: Option<(i32, i32)>,
+    visibility: BTreeMap<String, bool>,
+    colors: BTreeMap<String, String>,
+    /// Accordion expanded state, keyed by category title.
+    expanded: BTreeMap<String, bool>,
 }
 
-fn save_visibility(map: &BTreeMap<String, bool>) {
-    if let Ok(json) = serde_json::to_string_pretty(map) {
-        write_config("visibility.json", &json);
+/// Load the unified config.json. If it is absent, migrate from the older split
+/// files (visibility/colors/window.json) so existing settings are preserved.
+fn load_config() -> LoadedConfig {
+    let parsed = config_file("config.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    if let Some(v) = parsed {
+        return LoadedConfig {
+            window: v.get("window").and_then(|w| {
+                Some((w.get("width")?.as_i64()? as i32, w.get("height")?.as_i64()? as i32))
+            }),
+            visibility: v
+                .get("visibility")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
+            colors: v
+                .get("colors")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
+            expanded: v
+                .get("expanded")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default(),
+        };
+    }
+
+    // Migration path: read the legacy per-aspect files.
+    let legacy = |name: &str| -> BTreeMap<String, String> {
+        config_file(name)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    };
+    let visibility = config_file("visibility.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let window = config_file("window.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|w| Some((w.get("width")?.as_i64()? as i32, w.get("height")?.as_i64()? as i32)));
+    LoadedConfig { window, visibility, colors: legacy("colors.json"), expanded: BTreeMap::new() }
+}
+
+/// Remove the superseded split config files after migration to config.json.
+fn remove_legacy_configs() {
+    for name in ["visibility.json", "colors.json", "window.json"] {
+        if let Some(p) = config_file(name) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
-fn load_colors() -> BTreeMap<String, String> {
-    config_file("colors.json")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_colors(map: &BTreeMap<String, String>) {
-    if let Ok(json) = serde_json::to_string_pretty(map) {
-        write_config("colors.json", &json);
+/// Persist all UI state to config.json (atomically). Called on every change.
+fn save_config(st: &AppState) {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "window".into(),
+        serde_json::json!({ "width": st.window.0, "height": st.window.1 }),
+    );
+    root.insert("visibility".into(), serde_json::to_value(&st.visibility).unwrap_or_default());
+    root.insert("colors".into(), serde_json::to_value(&st.colors).unwrap_or_default());
+    root.insert("expanded".into(), serde_json::to_value(&st.expanded).unwrap_or_default());
+    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(root)) {
+        write_config("config.json", &json);
     }
 }
 
@@ -119,24 +172,6 @@ fn to_hex(c: (f64, f64, f64)) -> String {
         (c.1 * 255.0).round() as u8,
         (c.2 * 255.0).round() as u8
     )
-}
-
-/// Restore the last window size, falling back to the defaults. Values are
-/// clamped to a sane minimum so a corrupt config cannot produce a tiny window.
-fn load_window_size() -> (i32, i32) {
-    let def = (WINDOW_W, WINDOW_H);
-    let value = config_file("window.json")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let Some(v) = value else { return def };
-    let w = v.get("width").and_then(|x| x.as_i64()).unwrap_or(def.0 as i64) as i32;
-    let h = v.get("height").and_then(|x| x.as_i64()).unwrap_or(def.1 as i64) as i32;
-    (w.max(400), h.max(300))
-}
-
-fn save_window_size(width: i32, height: i32) {
-    let json = serde_json::json!({ "width": width, "height": height }).to_string();
-    write_config("window.json", &json);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -227,6 +262,10 @@ struct AppState {
     visibility: BTreeMap<String, bool>,
     /// Persisted per-series custom colors (label -> "#rrggbb").
     colors: BTreeMap<String, String>,
+    /// Persisted accordion expanded state, keyed by category title.
+    expanded: BTreeMap<String, bool>,
+    /// Last known window size (persisted on close).
+    window: (i32, i32),
 }
 
 /// 16-color palette; cycled if there are more series than colors.
@@ -466,7 +505,7 @@ fn ensure_metric(
                 m.color = c;
             }
             st.colors.insert(label.clone(), to_hex(c));
-            save_colors(&st.colors);
+            save_config(&st);
             drop(st);
             area.queue_draw();
         });
@@ -485,7 +524,7 @@ fn ensure_metric(
                 m.visible = active;
             }
             st.visibility.insert(label.clone(), active);
-            save_visibility(&st.visibility);
+            save_config(&st);
             drop(st);
             area.queue_draw();
         });
@@ -502,6 +541,9 @@ fn ensure_metric(
 }
 
 fn build_ui(app: &Application) {
+    let cfg = load_config();
+    let window_size = cfg.window.map(|(w, h)| (w.max(400), h.max(300))).unwrap_or((WINDOW_W, WINDOW_H));
+
     let state = Rc::new(RefCell::new(AppState {
         metrics: BTreeMap::new(),
         prev_cpu: HashMap::new(),
@@ -509,12 +551,14 @@ fn build_ui(app: &Application) {
         prev_disk: HashMap::new(),
         poll_count: 0,
         next_color: 0,
-        visibility: load_visibility(),
-        colors: load_colors(),
+        visibility: cfg.visibility,
+        colors: cfg.colors,
+        expanded: cfg.expanded,
+        window: window_size,
     }));
 
     // Side panel: one collapsible section (Expander) per category, each hidden
-    // until it has at least one series.
+    // until it has at least one series. The expanded/collapsed state persists.
     let list = GtkBox::new(Orientation::Vertical, 4);
     list.set_margin_top(6);
     list.set_margin_bottom(6);
@@ -525,10 +569,19 @@ fn build_ui(app: &Application) {
             let cbox = GtkBox::new(Orientation::Vertical, 2);
             cbox.set_margin_start(6);
             let exp = Expander::new(Some(unit.title()));
-            exp.set_expanded(true);
+            exp.set_expanded(state.borrow().expanded.get(unit.title()).copied().unwrap_or(true));
             exp.set_margin_start(4);
             exp.set_child(Some(&cbox));
             exp.set_visible(false);
+            {
+                let state = state.clone();
+                let title = unit.title().to_string();
+                exp.connect_expanded_notify(move |e| {
+                    let mut st = state.borrow_mut();
+                    st.expanded.insert(title.clone(), e.is_expanded());
+                    save_config(&st);
+                });
+            }
             list.append(&exp);
             (unit, cbox, exp)
         })
@@ -567,9 +620,10 @@ fn build_ui(app: &Application) {
         for (label, vis) in entries {
             st.visibility.entry(label).or_insert(vis);
         }
-        let snapshot = st.visibility.clone();
+        save_config(&st);
         drop(st);
-        save_visibility(&snapshot);
+        // Now that everything lives in config.json, drop any legacy split files.
+        remove_legacy_configs();
     }
 
     // Collection timer: runs independently of drawing.
@@ -626,7 +680,7 @@ fn build_ui(app: &Application) {
     content.append(&scroller);
     content.append(&area);
 
-    let (win_w, win_h) = load_window_size();
+    let (win_w, win_h) = window_size;
     let window = ApplicationWindow::builder()
         .application(app)
         .title("kagari")
@@ -637,11 +691,16 @@ fn build_ui(app: &Application) {
 
     // Persist the window size on close. In GTK4 the default size tracks the
     // current (non-maximized) size, so this captures the user's last resize.
-    window.connect_close_request(move |w| {
-        let (width, height) = w.default_size();
-        save_window_size(width, height);
-        glib::Propagation::Proceed
-    });
+    {
+        let state = state.clone();
+        window.connect_close_request(move |w| {
+            let (width, height) = w.default_size();
+            let mut st = state.borrow_mut();
+            st.window = (width, height);
+            save_config(&st);
+            glib::Propagation::Proceed
+        });
+    }
 
     window.present();
 }
