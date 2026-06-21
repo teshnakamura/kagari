@@ -54,11 +54,30 @@ On Debian/Ubuntu the build dependencies are:
 sudo apt install libgtk-4-dev lm-sensors
 ```
 
+## Install on Debian / Ubuntu
+
+Download (or build) the `.deb` and install it:
+
+```sh
+sudo apt install ./kagari_0.1.0_amd64.deb
+```
+
+`apt` resolves the runtime dependencies (`libgtk-4-1`, `lm-sensors`). After
+installation, launch it from the application grid ("Kagari") or run `kagari`.
+
 ## Build
 
 ```sh
 cargo build --release
 ```
+
+### Build the .deb yourself
+
+```sh
+./scripts/build-deb.sh        # writes dist/kagari_<version>_<arch>.deb
+```
+
+This drives `dpkg-deb` directly, so it works on any Rust toolchain.
 
 ## Run
 

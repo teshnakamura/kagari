@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Kagari
+GenericName=System Monitor
+Comment=Live system metrics graph (temperatures, CPU, memory, fans)
+Exec=/usr/bin/kagari
+Icon=kagari
+Terminal=false
+Categories=System;Monitor;
+Keywords=sensors;temperature;cpu;memory;fan;monitor;psensor;
+StartupNotify=true
+StartupWMClass=info.teshnakamura.Kagari
