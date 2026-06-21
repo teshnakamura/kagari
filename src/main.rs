@@ -110,6 +110,8 @@ enum Unit {
     Rpm,
     /// Network throughput, stored as bytes per second.
     Net,
+    /// Disk I/O throughput, stored as bytes per second.
+    Disk,
 }
 
 impl Unit {
@@ -119,14 +121,21 @@ impl Unit {
             Unit::Percent => "Usage (%)",
             Unit::Rpm => "Fan (RPM)",
             Unit::Net => "Network (bytes/s)",
+            Unit::Disk => "Disk I/O (bytes/s)",
         }
+    }
+
+    /// Whether this unit is a byte-rate (formatted with K/M/G).
+    fn is_rate(self) -> bool {
+        matches!(self, Unit::Net | Unit::Disk)
     }
 
     /// Format a value for the Y-axis tick labels.
     fn fmt_axis(self, v: f64) -> String {
-        match self {
-            Unit::Net => fmt_rate(v),
-            _ => format!("{:.0}", v),
+        if self.is_rate() {
+            fmt_rate(v)
+        } else {
+            format!("{:.0}", v)
         }
     }
 
@@ -136,7 +145,7 @@ impl Unit {
             Unit::Celsius => format!("{:.0}°C", v),
             Unit::Percent => format!("{:.0}%", v),
             Unit::Rpm => format!("{:.0}rpm", v),
-            Unit::Net => format!("{}B/s", fmt_rate(v)),
+            Unit::Net | Unit::Disk => format!("{}B/s", fmt_rate(v)),
         }
     }
 }
@@ -155,7 +164,8 @@ fn fmt_rate(bps: f64) -> String {
 }
 
 /// Fixed order in which bands are stacked top to bottom.
-const BAND_ORDER: [Unit; 4] = [Unit::Celsius, Unit::Percent, Unit::Rpm, Unit::Net];
+const BAND_ORDER: [Unit; 5] =
+    [Unit::Celsius, Unit::Percent, Unit::Rpm, Unit::Net, Unit::Disk];
 
 struct Metric {
     unit: Unit,
@@ -171,6 +181,8 @@ struct AppState {
     prev_cpu: HashMap<String, (u64, u64)>,
     /// Previous /proc/net/dev totals: (rx_bytes, tx_bytes) across interfaces.
     prev_net: Option<(u64, u64)>,
+    /// Previous disk totals: (read_bytes, write_bytes) across physical disks.
+    prev_disk: Option<(u64, u64)>,
     poll_count: u64,
     next_color: usize,
     /// Persisted per-series on/off state (label -> visible), loaded at startup
@@ -326,6 +338,49 @@ fn collect(st: &mut AppState) -> Vec<(String, Unit, f64)> {
         st.prev_net = Some((rx_total, tx_total));
     }
 
+    // Disk I/O from /sys/block/<dev>/stat. Only whole physical disks are listed
+    // there (partitions are nested), and virtual devices are filtered out, so
+    // summing avoids double-counting. Sectors are 512 bytes.
+    {
+        let mut rd_sectors: u64 = 0;
+        let mut wr_sectors: u64 = 0;
+        if let Ok(entries) = fs::read_dir("/sys/block") {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let virt = ["loop", "ram", "zram", "dm-", "md", "sr", "fd"]
+                    .iter()
+                    .any(|p| name.starts_with(p));
+                if virt {
+                    continue;
+                }
+                if let Ok(s) = fs::read_to_string(e.path().join("stat")) {
+                    let f: Vec<u64> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                    // 0:reads 1:reads_merged 2:sectors_read .. 6:sectors_written
+                    if f.len() >= 7 {
+                        rd_sectors += f[2];
+                        wr_sectors += f[6];
+                    }
+                }
+            }
+        }
+        let rd_bytes = rd_sectors * 512;
+        let wr_bytes = wr_sectors * 512;
+        if let Some((prev_rd, prev_wr)) = st.prev_disk {
+            let dt = POLL_INTERVAL_SECS as f64;
+            out.push((
+                "Disk read".to_string(),
+                Unit::Disk,
+                rd_bytes.saturating_sub(prev_rd) as f64 / dt,
+            ));
+            out.push((
+                "Disk write".to_string(),
+                Unit::Disk,
+                wr_bytes.saturating_sub(prev_wr) as f64 / dt,
+            ));
+        }
+        st.prev_disk = Some((rd_bytes, wr_bytes));
+    }
+
     out
 }
 
@@ -394,6 +449,7 @@ fn build_ui(app: &Application) {
         metrics: BTreeMap::new(),
         prev_cpu: HashMap::new(),
         prev_net: None,
+        prev_disk: None,
         poll_count: 0,
         next_color: 0,
         visibility: load_visibility(),
@@ -467,15 +523,18 @@ fn build_ui(app: &Application) {
             st.poll_count += 1;
             if debug_enabled() {
                 let visible = st.metrics.values().filter(|m| m.visible).count();
-                let rx = st.metrics.get("Network RX (down)").and_then(|m| m.history.back()).copied().unwrap_or(0.0);
-                let tx = st.metrics.get("Network TX (up)").and_then(|m| m.history.back()).copied().unwrap_or(0.0);
+                let val = |k: &str| {
+                    st.metrics.get(k).and_then(|m| m.history.back()).copied().unwrap_or(0.0)
+                };
                 eprintln!(
-                    "[poll #{}] metrics={} visible={} net_rx={:.0}B/s net_tx={:.0}B/s",
+                    "[poll #{}] metrics={} visible={} net_rx={:.0} net_tx={:.0} disk_rd={:.0} disk_wr={:.0}",
                     st.poll_count,
                     st.metrics.len(),
                     visible,
-                    rx,
-                    tx
+                    val("Network RX (down)"),
+                    val("Network TX (up)"),
+                    val("Disk read"),
+                    val("Disk write")
                 );
             }
             drop(st);
@@ -565,7 +624,7 @@ fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, st: &AppState) {
             }
             if !lo.is_finite() || !hi.is_finite() {
                 (0.0, 1.0)
-            } else if *unit == Unit::Rpm || *unit == Unit::Net {
+            } else if *unit == Unit::Rpm || unit.is_rate() {
                 // Rate/RPM bands are anchored at zero.
                 (0.0, hi.max(1.0))
             } else {

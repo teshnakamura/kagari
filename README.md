@@ -36,6 +36,8 @@ window is on screen.
   - **Fan (RPM)** — every `fanN_input` exposed by `lm-sensors`.
   - **Network (bytes/s)** — download (RX) and upload (TX) throughput summed over
     all interfaces except loopback (from `/proc/net/dev`).
+  - **Disk I/O (bytes/s)** — read and write throughput summed over the physical
+    disks (from `/sys/block/*/stat`, excluding partitions and virtual devices).
 - Per-series on/off toggles in a side panel, each with a color swatch.
 - Latest value shown at the right edge of each series.
 
@@ -61,7 +63,7 @@ sudo apt install libgtk-4-dev lm-sensors
 Download (or build) the `.deb` and install it:
 
 ```sh
-sudo apt install ./kagari_0.1.4_amd64.deb
+sudo apt install ./kagari_0.1.5_amd64.deb
 ```
 
 `apt` resolves the runtime dependencies (`libgtk-4-1`, `lm-sensors`). After
