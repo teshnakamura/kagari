@@ -50,35 +50,57 @@ fn debug_enabled() -> bool {
     std::env::var("KAGARI_DEBUG").map(|v| v == "1").unwrap_or(false)
 }
 
-/// Path to the persisted visibility state: $XDG_CONFIG_HOME/kagari/visibility.json
-/// (falling back to ~/.config/kagari/visibility.json).
-fn config_path() -> Option<std::path::PathBuf> {
+/// Path to a config file under $XDG_CONFIG_HOME/kagari/ (falling back to
+/// ~/.config/kagari/).
+fn config_file(name: &str) -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    Some(base.join("kagari").join("visibility.json"))
+    Some(base.join("kagari").join(name))
+}
+
+/// Write `contents` to a config file atomically (temp file + rename). Failures
+/// are ignored so the app keeps working even if the config dir is unwritable.
+fn write_config(name: &str, contents: &str) {
+    let Some(path) = config_file(name) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 fn load_visibility() -> BTreeMap<String, bool> {
-    config_path()
+    config_file("visibility.json")
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-/// Persist the visibility map. Writes to a temp file and renames for atomicity;
-/// failures are ignored so the app keeps working even if the config is unwritable.
 fn save_visibility(map: &BTreeMap<String, bool>) {
-    let Some(path) = config_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     if let Ok(json) = serde_json::to_string_pretty(map) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        write_config("visibility.json", &json);
     }
+}
+
+/// Restore the last window size, falling back to the defaults. Values are
+/// clamped to a sane minimum so a corrupt config cannot produce a tiny window.
+fn load_window_size() -> (i32, i32) {
+    let def = (WINDOW_W, WINDOW_H);
+    let value = config_file("window.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let Some(v) = value else { return def };
+    let w = v.get("width").and_then(|x| x.as_i64()).unwrap_or(def.0 as i64) as i32;
+    let h = v.get("height").and_then(|x| x.as_i64()).unwrap_or(def.1 as i64) as i32;
+    (w.max(400), h.max(300))
+}
+
+fn save_window_size(width: i32, height: i32) {
+    let json = serde_json::json!({ "width": width, "height": height }).to_string();
+    write_config("window.json", &json);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -405,13 +427,23 @@ fn build_ui(app: &Application) {
     content.append(&scroller);
     content.append(&area);
 
+    let (win_w, win_h) = load_window_size();
     let window = ApplicationWindow::builder()
         .application(app)
         .title("kagari")
-        .default_width(WINDOW_W)
-        .default_height(WINDOW_H)
+        .default_width(win_w)
+        .default_height(win_h)
         .child(&content)
         .build();
+
+    // Persist the window size on close. In GTK4 the default size tracks the
+    // current (non-maximized) size, so this captures the user's last resize.
+    window.connect_close_request(move |w| {
+        let (width, height) = w.default_size();
+        save_window_size(width, height);
+        glib::Propagation::Proceed
+    });
+
     window.present();
 }
 
