@@ -24,9 +24,10 @@ use gtk4 as gtk;
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::glib;
 use gtk::prelude::*;
+use gtk::gdk::RGBA;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, CheckButton, DrawingArea, Expander, Orientation,
-    PolicyType, ScrolledWindow,
+    Application, ApplicationWindow, Box as GtkBox, CheckButton, ColorDialog, ColorDialogButton,
+    DrawingArea, Expander, Orientation, PolicyType, ScrolledWindow,
 };
 
 const APP_ID: &str = "info.teshnakamura.Kagari";
@@ -83,6 +84,41 @@ fn save_visibility(map: &BTreeMap<String, bool>) {
     if let Ok(json) = serde_json::to_string_pretty(map) {
         write_config("visibility.json", &json);
     }
+}
+
+fn load_colors() -> BTreeMap<String, String> {
+    config_file("colors.json")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_colors(map: &BTreeMap<String, String>) {
+    if let Ok(json) = serde_json::to_string_pretty(map) {
+        write_config("colors.json", &json);
+    }
+}
+
+/// Parse "#rrggbb" into an RGB triple in 0..1.
+fn parse_hex(s: &str) -> Option<(f64, f64, f64)> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0))
+}
+
+/// Format an RGB triple (0..1) as "#rrggbb".
+fn to_hex(c: (f64, f64, f64)) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (c.0 * 255.0).round() as u8,
+        (c.1 * 255.0).round() as u8,
+        (c.2 * 255.0).round() as u8
+    )
 }
 
 /// Restore the last window size, falling back to the defaults. Values are
@@ -171,7 +207,8 @@ struct Metric {
     unit: Unit,
     history: VecDeque<f64>,
     visible: bool,
-    color_index: usize,
+    /// Resolved RGB color (custom override if set, otherwise from the palette).
+    color: (f64, f64, f64),
 }
 
 struct AppState {
@@ -179,8 +216,8 @@ struct AppState {
     metrics: BTreeMap<String, Metric>,
     /// Previous /proc/stat counters per CPU line: (idle_all, total).
     prev_cpu: HashMap<String, (u64, u64)>,
-    /// Previous /proc/net/dev totals: (rx_bytes, tx_bytes) across interfaces.
-    prev_net: Option<(u64, u64)>,
+    /// Previous per-interface /proc/net/dev totals: iface -> (rx_bytes, tx_bytes).
+    prev_net: HashMap<String, (u64, u64)>,
     /// Previous per-device disk totals: name -> (read_bytes, write_bytes).
     prev_disk: HashMap<String, (u64, u64)>,
     poll_count: u64,
@@ -188,6 +225,8 @@ struct AppState {
     /// Persisted per-series on/off state (label -> visible), loaded at startup
     /// and written to disk whenever a toggle changes.
     visibility: BTreeMap<String, bool>,
+    /// Persisted per-series custom colors (label -> "#rrggbb").
+    colors: BTreeMap<String, String>,
 }
 
 /// 16-color palette; cycled if there are more series than colors.
@@ -311,31 +350,29 @@ fn collect(st: &mut AppState) -> Vec<(String, Unit, f64)> {
         }
     }
 
-    // Network throughput from /proc/net/dev: sum rx/tx bytes over all
-    // interfaces except loopback, then report the per-second delta.
+    // Network throughput per interface from /proc/net/dev. Loopback and the
+    // ephemeral docker veth pairs are skipped.
     if let Ok(net) = fs::read_to_string("/proc/net/dev") {
-        let mut rx_total: u64 = 0;
-        let mut tx_total: u64 = 0;
+        let dt = POLL_INTERVAL_SECS as f64;
         for line in net.lines() {
             let Some((iface, rest)) = line.split_once(':') else { continue };
-            if iface.trim() == "lo" {
+            let iface = iface.trim();
+            // Skip loopback and the ephemeral docker veth pairs / per-network bridges.
+            if iface == "lo" || iface.starts_with("veth") || iface.starts_with("br-") {
                 continue;
             }
             let nums: Vec<u64> = rest.split_whitespace().filter_map(|t| t.parse().ok()).collect();
             // Receive bytes = column 0, transmit bytes = column 8.
-            if nums.len() >= 9 {
-                rx_total += nums[0];
-                tx_total += nums[8];
+            if nums.len() < 9 {
+                continue;
             }
+            let (rx, tx) = (nums[0], nums[8]);
+            if let Some(&(prev_rx, prev_tx)) = st.prev_net.get(iface) {
+                out.push((format!("{} RX", iface), Unit::Net, rx.saturating_sub(prev_rx) as f64 / dt));
+                out.push((format!("{} TX", iface), Unit::Net, tx.saturating_sub(prev_tx) as f64 / dt));
+            }
+            st.prev_net.insert(iface.to_string(), (rx, tx));
         }
-        if let Some((prev_rx, prev_tx)) = st.prev_net {
-            let dt = POLL_INTERVAL_SECS as f64;
-            let rx_rate = rx_total.saturating_sub(prev_rx) as f64 / dt;
-            let tx_rate = tx_total.saturating_sub(prev_tx) as f64 / dt;
-            out.push(("Network RX (down)".to_string(), Unit::Net, rx_rate));
-            out.push(("Network TX (up)".to_string(), Unit::Net, tx_rate));
-        }
-        st.prev_net = Some((rx_total, tx_total));
     }
 
     // Disk I/O per physical device from /sys/block/<dev>/stat. Only whole disks
@@ -386,6 +423,7 @@ fn parse_kb(s: &str) -> f64 {
 fn ensure_metric(
     state: &Rc<RefCell<AppState>>,
     categories: &[(Unit, GtkBox, Expander)],
+    area: &DrawingArea,
     label: &str,
     unit: Unit,
 ) {
@@ -398,34 +436,47 @@ fn ensure_metric(
         }
         let ci = st.next_color;
         st.next_color += 1;
-        color = color_for(ci);
+        // Use a saved custom color if present, otherwise the next palette color.
+        color = st.colors.get(label).and_then(|s| parse_hex(s)).unwrap_or_else(|| color_for(ci));
         // Restore the saved on/off state for this series (default on).
         visible = st.visibility.get(label).copied().unwrap_or(true);
         st.metrics.insert(
             label.to_string(),
-            Metric { unit, history: VecDeque::new(), visible, color_index: ci },
+            Metric { unit, history: VecDeque::new(), visible, color },
         );
     }
 
-    // Build the toggle row: color swatch + checkbox.
+    // Build the toggle row: clickable color button + checkbox.
     let row = GtkBox::new(Orientation::Horizontal, 6);
     row.set_margin_start(8);
     row.set_margin_end(8);
 
-    let swatch = DrawingArea::new();
-    swatch.set_content_width(14);
-    swatch.set_content_height(14);
-    swatch.set_valign(gtk::Align::Center);
-    swatch.set_draw_func(move |_, cr, w, h| {
-        cr.set_source_rgb(color.0, color.1, color.2);
-        cr.rectangle(0.0, 0.0, w as f64, h as f64);
-        let _ = cr.fill();
-    });
+    let color_btn = ColorDialogButton::new(Some(ColorDialog::new()));
+    color_btn.set_rgba(&RGBA::new(color.0 as f32, color.1 as f32, color.2 as f32, 1.0));
+    color_btn.set_valign(gtk::Align::Center);
+    {
+        let state = state.clone();
+        let area = area.clone();
+        let label = label.to_string();
+        color_btn.connect_rgba_notify(move |b| {
+            let rgba = b.rgba();
+            let c = (rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64);
+            let mut st = state.borrow_mut();
+            if let Some(m) = st.metrics.get_mut(&label) {
+                m.color = c;
+            }
+            st.colors.insert(label.clone(), to_hex(c));
+            save_colors(&st.colors);
+            drop(st);
+            area.queue_draw();
+        });
+    }
 
     let check = CheckButton::with_label(label);
     check.set_active(visible);
     {
         let state = state.clone();
+        let area = area.clone();
         let label = label.to_string();
         check.connect_toggled(move |c| {
             let active = c.is_active();
@@ -435,10 +486,12 @@ fn ensure_metric(
             }
             st.visibility.insert(label.clone(), active);
             save_visibility(&st.visibility);
+            drop(st);
+            area.queue_draw();
         });
     }
 
-    row.append(&swatch);
+    row.append(&color_btn);
     row.append(&check);
 
     // Append to this metric's category section and reveal it.
@@ -452,11 +505,12 @@ fn build_ui(app: &Application) {
     let state = Rc::new(RefCell::new(AppState {
         metrics: BTreeMap::new(),
         prev_cpu: HashMap::new(),
-        prev_net: None,
+        prev_net: HashMap::new(),
         prev_disk: HashMap::new(),
         poll_count: 0,
         next_color: 0,
         visibility: load_visibility(),
+        colors: load_colors(),
     }));
 
     // Side panel: one collapsible section (Expander) per category, each hidden
@@ -500,7 +554,7 @@ fn build_ui(app: &Application) {
     {
         let samples = collect(&mut state.borrow_mut());
         for (label, unit, value) in samples {
-            ensure_metric(&state, &categories, &label, unit);
+            ensure_metric(&state, &categories, &area, &label, unit);
             if let Some(m) = state.borrow_mut().metrics.get_mut(&label) {
                 m.history.push_back(value);
             }
@@ -526,7 +580,7 @@ fn build_ui(app: &Application) {
         glib::timeout_add_seconds_local(POLL_INTERVAL_SECS, move || {
             let samples = collect(&mut state.borrow_mut());
             for (label, unit, value) in samples {
-                ensure_metric(&state, &categories, &label, unit);
+                ensure_metric(&state, &categories, &area, &label, unit);
                 let mut st = state.borrow_mut();
                 if let Some(m) = st.metrics.get_mut(&label) {
                     m.history.push_back(value);
@@ -539,20 +593,16 @@ fn build_ui(app: &Application) {
             st.poll_count += 1;
             if debug_enabled() {
                 let visible = st.metrics.values().filter(|m| m.visible).count();
-                let latest = |k: &str| {
-                    st.metrics.get(k).and_then(|m| m.history.back()).copied().unwrap_or(0.0)
-                };
-                // Disk is per-device now; sum read/write across all Disk series.
-                let mut disk_rd = 0.0;
-                let mut disk_wr = 0.0;
+                // Net and Disk are per-device now; sum each direction.
+                let (mut net_rx, mut net_tx, mut disk_rd, mut disk_wr) = (0.0, 0.0, 0.0, 0.0);
                 for (k, m) in &st.metrics {
-                    if m.unit == Unit::Disk {
-                        let v = m.history.back().copied().unwrap_or(0.0);
-                        if k.ends_with("read") {
-                            disk_rd += v;
-                        } else {
-                            disk_wr += v;
-                        }
+                    let v = m.history.back().copied().unwrap_or(0.0);
+                    match m.unit {
+                        Unit::Net if k.ends_with("RX") => net_rx += v,
+                        Unit::Net => net_tx += v,
+                        Unit::Disk if k.ends_with("read") => disk_rd += v,
+                        Unit::Disk => disk_wr += v,
+                        _ => {}
                     }
                 }
                 eprintln!(
@@ -560,8 +610,8 @@ fn build_ui(app: &Application) {
                     st.poll_count,
                     st.metrics.len(),
                     visible,
-                    latest("Network RX (down)"),
-                    latest("Network TX (up)"),
+                    net_rx,
+                    net_tx,
                     disk_rd,
                     disk_wr
                 );
@@ -701,7 +751,7 @@ fn draw_graph(cr: &gtk::cairo::Context, w: i32, h: i32, st: &AppState) {
 
         // Series lines + latest-value labels.
         for m in st.metrics.values().filter(|m| m.visible && m.unit == *unit) {
-            let (r, g, b) = color_for(m.color_index);
+            let (r, g, b) = m.color;
             if m.history.len() >= 2 {
                 cr.set_source_rgb(r, g, b);
                 cr.set_line_width(1.6);
