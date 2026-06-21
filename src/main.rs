@@ -25,7 +25,7 @@ use gtk::cairo::{FontSlant, FontWeight};
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, CheckButton, DrawingArea, Label, Orientation,
+    Application, ApplicationWindow, Box as GtkBox, CheckButton, DrawingArea, Expander, Orientation,
     PolicyType, ScrolledWindow,
 };
 
@@ -181,8 +181,8 @@ struct AppState {
     prev_cpu: HashMap<String, (u64, u64)>,
     /// Previous /proc/net/dev totals: (rx_bytes, tx_bytes) across interfaces.
     prev_net: Option<(u64, u64)>,
-    /// Previous disk totals: (read_bytes, write_bytes) across physical disks.
-    prev_disk: Option<(u64, u64)>,
+    /// Previous per-device disk totals: name -> (read_bytes, write_bytes).
+    prev_disk: HashMap<String, (u64, u64)>,
     poll_count: u64,
     next_color: usize,
     /// Persisted per-series on/off state (label -> visible), loaded at startup
@@ -338,47 +338,41 @@ fn collect(st: &mut AppState) -> Vec<(String, Unit, f64)> {
         st.prev_net = Some((rx_total, tx_total));
     }
 
-    // Disk I/O from /sys/block/<dev>/stat. Only whole physical disks are listed
-    // there (partitions are nested), and virtual devices are filtered out, so
-    // summing avoids double-counting. Sectors are 512 bytes.
-    {
-        let mut rd_sectors: u64 = 0;
-        let mut wr_sectors: u64 = 0;
-        if let Ok(entries) = fs::read_dir("/sys/block") {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let virt = ["loop", "ram", "zram", "dm-", "md", "sr", "fd"]
-                    .iter()
-                    .any(|p| name.starts_with(p));
-                if virt {
-                    continue;
-                }
-                if let Ok(s) = fs::read_to_string(e.path().join("stat")) {
-                    let f: Vec<u64> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-                    // 0:reads 1:reads_merged 2:sectors_read .. 6:sectors_written
-                    if f.len() >= 7 {
-                        rd_sectors += f[2];
-                        wr_sectors += f[6];
-                    }
-                }
+    // Disk I/O per physical device from /sys/block/<dev>/stat. Only whole disks
+    // are listed there (partitions are nested) and virtual devices are filtered
+    // out. Sectors are 512 bytes.
+    if let Ok(entries) = fs::read_dir("/sys/block") {
+        let dt = POLL_INTERVAL_SECS as f64;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let virt = ["loop", "ram", "zram", "dm-", "md", "sr", "fd"]
+                .iter()
+                .any(|p| name.starts_with(p));
+            if virt {
+                continue;
             }
+            let Ok(s) = fs::read_to_string(e.path().join("stat")) else { continue };
+            let f: Vec<u64> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            // 0:reads 1:reads_merged 2:sectors_read .. 6:sectors_written
+            if f.len() < 7 {
+                continue;
+            }
+            let rd_bytes = f[2] * 512;
+            let wr_bytes = f[6] * 512;
+            if let Some(&(prev_rd, prev_wr)) = st.prev_disk.get(&name) {
+                out.push((
+                    format!("{} read", name),
+                    Unit::Disk,
+                    rd_bytes.saturating_sub(prev_rd) as f64 / dt,
+                ));
+                out.push((
+                    format!("{} write", name),
+                    Unit::Disk,
+                    wr_bytes.saturating_sub(prev_wr) as f64 / dt,
+                ));
+            }
+            st.prev_disk.insert(name, (rd_bytes, wr_bytes));
         }
-        let rd_bytes = rd_sectors * 512;
-        let wr_bytes = wr_sectors * 512;
-        if let Some((prev_rd, prev_wr)) = st.prev_disk {
-            let dt = POLL_INTERVAL_SECS as f64;
-            out.push((
-                "Disk read".to_string(),
-                Unit::Disk,
-                rd_bytes.saturating_sub(prev_rd) as f64 / dt,
-            ));
-            out.push((
-                "Disk write".to_string(),
-                Unit::Disk,
-                wr_bytes.saturating_sub(prev_wr) as f64 / dt,
-            ));
-        }
-        st.prev_disk = Some((rd_bytes, wr_bytes));
     }
 
     out
@@ -389,7 +383,12 @@ fn parse_kb(s: &str) -> f64 {
 }
 
 /// Ensure a metric and its side-panel toggle row exist before appending a value.
-fn ensure_metric(state: &Rc<RefCell<AppState>>, list: &GtkBox, label: &str, unit: Unit) {
+fn ensure_metric(
+    state: &Rc<RefCell<AppState>>,
+    categories: &[(Unit, GtkBox, Expander)],
+    label: &str,
+    unit: Unit,
+) {
     let color;
     let visible;
     {
@@ -441,7 +440,12 @@ fn ensure_metric(state: &Rc<RefCell<AppState>>, list: &GtkBox, label: &str, unit
 
     row.append(&swatch);
     row.append(&check);
-    list.append(&row);
+
+    // Append to this metric's category section and reveal it.
+    if let Some((_, cbox, exp)) = categories.iter().find(|(u, _, _)| *u == unit) {
+        cbox.append(&row);
+        exp.set_visible(true);
+    }
 }
 
 fn build_ui(app: &Application) {
@@ -449,20 +453,32 @@ fn build_ui(app: &Application) {
         metrics: BTreeMap::new(),
         prev_cpu: HashMap::new(),
         prev_net: None,
-        prev_disk: None,
+        prev_disk: HashMap::new(),
         poll_count: 0,
         next_color: 0,
         visibility: load_visibility(),
     }));
 
-    // Side panel: scrollable list of per-series toggles.
-    let list = GtkBox::new(Orientation::Vertical, 2);
+    // Side panel: one collapsible section (Expander) per category, each hidden
+    // until it has at least one series.
+    let list = GtkBox::new(Orientation::Vertical, 4);
     list.set_margin_top(6);
     list.set_margin_bottom(6);
-    let header = Label::new(Some("Sensors"));
-    header.set_margin_start(8);
-    header.set_halign(gtk::Align::Start);
-    list.append(&header);
+
+    let categories: Vec<(Unit, GtkBox, Expander)> = BAND_ORDER
+        .iter()
+        .map(|&unit| {
+            let cbox = GtkBox::new(Orientation::Vertical, 2);
+            cbox.set_margin_start(6);
+            let exp = Expander::new(Some(unit.title()));
+            exp.set_expanded(true);
+            exp.set_margin_start(4);
+            exp.set_child(Some(&cbox));
+            exp.set_visible(false);
+            list.append(&exp);
+            (unit, cbox, exp)
+        })
+        .collect();
 
     let scroller = ScrolledWindow::new();
     scroller.set_policy(PolicyType::Never, PolicyType::Automatic);
@@ -484,7 +500,7 @@ fn build_ui(app: &Application) {
     {
         let samples = collect(&mut state.borrow_mut());
         for (label, unit, value) in samples {
-            ensure_metric(&state, &list, &label, unit);
+            ensure_metric(&state, &categories, &label, unit);
             if let Some(m) = state.borrow_mut().metrics.get_mut(&label) {
                 m.history.push_back(value);
             }
@@ -505,12 +521,12 @@ fn build_ui(app: &Application) {
     // Collection timer: runs independently of drawing.
     {
         let state = state.clone();
-        let list = list.clone();
+        let categories = categories.clone();
         let area = area.clone();
         glib::timeout_add_seconds_local(POLL_INTERVAL_SECS, move || {
             let samples = collect(&mut state.borrow_mut());
             for (label, unit, value) in samples {
-                ensure_metric(&state, &list, &label, unit);
+                ensure_metric(&state, &categories, &label, unit);
                 let mut st = state.borrow_mut();
                 if let Some(m) = st.metrics.get_mut(&label) {
                     m.history.push_back(value);
@@ -523,18 +539,31 @@ fn build_ui(app: &Application) {
             st.poll_count += 1;
             if debug_enabled() {
                 let visible = st.metrics.values().filter(|m| m.visible).count();
-                let val = |k: &str| {
+                let latest = |k: &str| {
                     st.metrics.get(k).and_then(|m| m.history.back()).copied().unwrap_or(0.0)
                 };
+                // Disk is per-device now; sum read/write across all Disk series.
+                let mut disk_rd = 0.0;
+                let mut disk_wr = 0.0;
+                for (k, m) in &st.metrics {
+                    if m.unit == Unit::Disk {
+                        let v = m.history.back().copied().unwrap_or(0.0);
+                        if k.ends_with("read") {
+                            disk_rd += v;
+                        } else {
+                            disk_wr += v;
+                        }
+                    }
+                }
                 eprintln!(
                     "[poll #{}] metrics={} visible={} net_rx={:.0} net_tx={:.0} disk_rd={:.0} disk_wr={:.0}",
                     st.poll_count,
                     st.metrics.len(),
                     visible,
-                    val("Network RX (down)"),
-                    val("Network TX (up)"),
-                    val("Disk read"),
-                    val("Disk write")
+                    latest("Network RX (down)"),
+                    latest("Network TX (up)"),
+                    disk_rd,
+                    disk_wr
                 );
             }
             drop(st);
