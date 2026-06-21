@@ -1,44 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#26262e"/>
-      <stop offset="1" stop-color="#121214"/>
+      <stop offset="0" stop-color="#ff8a1e"/>
+      <stop offset="1" stop-color="#c81e0f"/>
     </linearGradient>
     <linearGradient id="flame" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#b21717"/>
-      <stop offset="0.5" stop-color="#f0641e"/>
-      <stop offset="0.85" stop-color="#ffb020"/>
-      <stop offset="1" stop-color="#ffe07a"/>
+      <stop offset="0" stop-color="#ffd24a"/>
+      <stop offset="1" stop-color="#fffbe6"/>
     </linearGradient>
-    <linearGradient id="inner" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#ffb020"/>
-      <stop offset="1" stop-color="#fff4cf"/>
+    <linearGradient id="core" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff6a00"/>
+      <stop offset="1" stop-color="#ffb02e"/>
     </linearGradient>
   </defs>
 
   <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="url(#bg)"/>
 
-  <!-- outer flame -->
-  <path d="M128 26
-           C 142 64, 176 86, 176 138
-           C 176 184, 154 220, 128 220
-           C 102 220, 80 190, 80 146
-           C 80 112, 110 100, 110 68
-           C 116 54, 122 40, 128 26 Z"
+  <!-- outer flame (cream) -->
+  <path d="M128 24
+           C 146 66, 184 88, 184 142
+           C 184 190, 158 226, 128 226
+           C 98 226, 72 194, 72 146
+           C 72 108, 108 96, 108 64
+           C 116 48, 122 38, 128 24 Z"
         fill="url(#flame)"/>
 
-  <!-- inner flame -->
-  <path d="M128 92
-           C 138 116, 154 128, 154 156
-           C 154 184, 142 206, 128 206
-           C 114 206, 100 190, 100 162
-           C 100 140, 122 130, 122 108
-           C 124 102, 126 98, 128 92 Z"
-        fill="url(#inner)"/>
-
-  <!-- embers -->
-  <circle cx="186" cy="92" r="5" fill="#ffb020" opacity="0.85"/>
-  <circle cx="70"  cy="118" r="4" fill="#f0641e" opacity="0.8"/>
-  <circle cx="196" cy="150" r="3.5" fill="#ffe07a" opacity="0.8"/>
-  <circle cx="64"  cy="170" r="3" fill="#ffb020" opacity="0.7"/>
+  <!-- inner flame (warm core) -->
+  <path d="M128 96
+           C 140 122, 158 134, 158 164
+           C 158 192, 144 214, 128 214
+           C 112 214, 98 196, 98 166
+           C 98 144, 122 134, 122 110
+           C 124 104, 126 100, 128 96 Z"
+        fill="url(#core)"/>
 </svg>

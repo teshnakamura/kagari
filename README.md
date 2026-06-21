@@ -59,7 +59,7 @@ sudo apt install libgtk-4-dev lm-sensors
 Download (or build) the `.deb` and install it:
 
 ```sh
-sudo apt install ./kagari_0.1.1_amd64.deb
+sudo apt install ./kagari_0.1.2_amd64.deb
 ```
 
 `apt` resolves the runtime dependencies (`libgtk-4-1`, `lm-sensors`). After
