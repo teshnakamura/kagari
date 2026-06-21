@@ -50,6 +50,37 @@ fn debug_enabled() -> bool {
     std::env::var("KAGARI_DEBUG").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Path to the persisted visibility state: $XDG_CONFIG_HOME/kagari/visibility.json
+/// (falling back to ~/.config/kagari/visibility.json).
+fn config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("kagari").join("visibility.json"))
+}
+
+fn load_visibility() -> BTreeMap<String, bool> {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the visibility map. Writes to a temp file and renames for atomicity;
+/// failures are ignored so the app keeps working even if the config is unwritable.
+fn save_visibility(map: &BTreeMap<String, bool>) {
+    let Some(path) = config_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(map) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Unit {
     Celsius,
@@ -91,6 +122,9 @@ struct AppState {
     prev_cpu: HashMap<String, (u64, u64)>,
     poll_count: u64,
     next_color: usize,
+    /// Persisted per-series on/off state (label -> visible), loaded at startup
+    /// and written to disk whenever a toggle changes.
+    visibility: BTreeMap<String, bool>,
 }
 
 /// 16-color palette; cycled if there are more series than colors.
@@ -224,6 +258,7 @@ fn parse_kb(s: &str) -> f64 {
 /// Ensure a metric and its side-panel toggle row exist before appending a value.
 fn ensure_metric(state: &Rc<RefCell<AppState>>, list: &GtkBox, label: &str, unit: Unit) {
     let color;
+    let visible;
     {
         let mut st = state.borrow_mut();
         if st.metrics.contains_key(label) {
@@ -232,9 +267,11 @@ fn ensure_metric(state: &Rc<RefCell<AppState>>, list: &GtkBox, label: &str, unit
         let ci = st.next_color;
         st.next_color += 1;
         color = color_for(ci);
+        // Restore the saved on/off state for this series (default on).
+        visible = st.visibility.get(label).copied().unwrap_or(true);
         st.metrics.insert(
             label.to_string(),
-            Metric { unit, history: VecDeque::new(), visible: true, color_index: ci },
+            Metric { unit, history: VecDeque::new(), visible, color_index: ci },
         );
     }
 
@@ -254,14 +291,18 @@ fn ensure_metric(state: &Rc<RefCell<AppState>>, list: &GtkBox, label: &str, unit
     });
 
     let check = CheckButton::with_label(label);
-    check.set_active(true);
+    check.set_active(visible);
     {
         let state = state.clone();
         let label = label.to_string();
         check.connect_toggled(move |c| {
-            if let Some(m) = state.borrow_mut().metrics.get_mut(&label) {
-                m.visible = c.is_active();
+            let active = c.is_active();
+            let mut st = state.borrow_mut();
+            if let Some(m) = st.metrics.get_mut(&label) {
+                m.visible = active;
             }
+            st.visibility.insert(label.clone(), active);
+            save_visibility(&st.visibility);
         });
     }
 
@@ -276,6 +317,7 @@ fn build_ui(app: &Application) {
         prev_cpu: HashMap::new(),
         poll_count: 0,
         next_color: 0,
+        visibility: load_visibility(),
     }));
 
     // Side panel: scrollable list of per-series toggles.
@@ -312,7 +354,17 @@ fn build_ui(app: &Application) {
                 m.history.push_back(value);
             }
         }
-        state.borrow_mut().poll_count += 1;
+        // Persist the (possibly newly discovered) set so the file always exists.
+        let mut st = state.borrow_mut();
+        st.poll_count += 1;
+        let entries: Vec<(String, bool)> =
+            st.metrics.iter().map(|(l, m)| (l.clone(), m.visible)).collect();
+        for (label, vis) in entries {
+            st.visibility.entry(label).or_insert(vis);
+        }
+        let snapshot = st.visibility.clone();
+        drop(st);
+        save_visibility(&snapshot);
     }
 
     // Collection timer: runs independently of drawing.
@@ -335,7 +387,13 @@ fn build_ui(app: &Application) {
             let mut st = state.borrow_mut();
             st.poll_count += 1;
             if debug_enabled() {
-                eprintln!("[poll #{}] metrics={}", st.poll_count, st.metrics.len());
+                let visible = st.metrics.values().filter(|m| m.visible).count();
+                eprintln!(
+                    "[poll #{}] metrics={} visible={}",
+                    st.poll_count,
+                    st.metrics.len(),
+                    visible
+                );
             }
             drop(st);
             area.queue_draw();
