@@ -1,7 +1,11 @@
-# sensor-graph
+# kagari (篝)
 
 A small, Wayland-native live graph of system metrics (temperatures, CPU/memory
 usage, fan speeds), written in Rust with GTK4.
+
+The name comes from *kagari-bi* (篝火), a watchfire kept burning through the night
+to keep watch. It fits the tool on three counts: it **watches** (monitoring), it
+is about **heat**, and it **never goes dark** (it keeps updating on Wayland).
 
 ## Why
 
@@ -10,7 +14,7 @@ sessions. There it suffers from Mutter's frame-callback throttling: the graph
 **stops updating even while the window is visible**, and only redraws when the
 window receives an event (e.g. a resize).
 
-`sensor-graph` avoids this by design. It cleanly separates two concerns:
+`kagari` avoids this by design. It cleanly separates two concerns:
 
 - **Collection timer** (`glib::timeout`) — always polls the data sources and
   appends to each metric's history, independently of drawing.
@@ -59,10 +63,10 @@ cargo build --release
 ## Run
 
 ```sh
-./target/release/sensor-graph
+./target/release/kagari
 ```
 
-Set `SENSOR_GRAPH_DEBUG=1` to print polling activity to stderr.
+Set `KAGARI_DEBUG=1` to print polling activity to stderr.
 
 ## Configuration
 

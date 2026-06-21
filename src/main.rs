@@ -1,4 +1,7 @@
-//! sensor-graph — a Wayland-native live system metrics graph.
+//! kagari (篝) — a Wayland-native live system metrics graph.
+//!
+//! Named after the kagari-bi, a watchfire kept burning through the night to keep
+//! watch: it watches (monitoring), it is about heat, and it never goes dark.
 //!
 //! psensor (a GTK2 app running under XWayland) suffers from Mutter's frame-callback
 //! throttling: the graph stops updating even while the window is visible. This tool
@@ -26,7 +29,7 @@ use gtk::{
     PolicyType, ScrolledWindow,
 };
 
-const APP_ID: &str = "info.teshnakamura.SensorGraph";
+const APP_ID: &str = "info.teshnakamura.Kagari";
 const POLL_INTERVAL_SECS: u32 = 2;
 /// Number of history points. At POLL_INTERVAL_SECS spacing, 600 points = 20 minutes.
 const HISTORY_LEN: usize = 600;
@@ -44,7 +47,7 @@ const Y_TICKS: usize = 4;
 const MIN_Y_SPAN: f64 = 8.0;
 
 fn debug_enabled() -> bool {
-    std::env::var("SENSOR_GRAPH_DEBUG").map(|v| v == "1").unwrap_or(false)
+    std::env::var("KAGARI_DEBUG").map(|v| v == "1").unwrap_or(false)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -346,7 +349,7 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("sensor-graph")
+        .title("kagari")
         .default_width(WINDOW_W)
         .default_height(WINDOW_H)
         .child(&content)

@@ -1,8 +1,8 @@
 [package]
-name = "sensor-graph"
+name = "kagari"
 version = "0.1.0"
 edition = "2021"
-description = "Wayland-native live temperature graph (psensor replacement)"
+description = "Wayland-native live system metrics graph (psensor replacement)"
 
 [dependencies]
 gtk4 = "0.9"
